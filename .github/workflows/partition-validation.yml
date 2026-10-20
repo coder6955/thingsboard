@@ -24,6 +24,18 @@ jobs:
           distribution: temurin
           java-version: '25'
           cache: maven
+      - name: Install checksum-verified Maven 3.9.11
+        run: |
+          cd "$RUNNER_TEMP"
+          archive=apache-maven-3.9.11-bin.tar.gz
+          url="https://archive.apache.org/dist/maven/maven-3/3.9.11/binaries/$archive"
+          curl --fail --location --retry 3 "$url" -o "$archive"
+          curl --fail --location --retry 3 "$url.sha512" -o "$archive.sha512"
+          digest=$(grep -Eo '[0-9a-fA-F]{128}' "$archive.sha512" | head -n 1)
+          test "${#digest}" -eq 128
+          echo "$digest  $archive" | sha512sum --check
+          tar -xzf "$archive"
+          echo "$RUNNER_TEMP/apache-maven-3.9.11/bin" >> "$GITHUB_PATH"
       - name: Verify source and tools
         run: |
           mkdir -p validation-evidence
