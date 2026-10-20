@@ -1,0 +1,87 @@
+name: Validate partition identifiers on Linux
+
+on:
+  push:
+    branches: [validation/partition-identifiers]
+
+permissions:
+  contents: read
+
+jobs:
+  dao:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    env:
+      MAVEN_OPTS: -Xmx3g -XX:+ExitOnOutOfMemoryError
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: b994e5f5f4d10f61817ad18ad5cf256ceed62ae3
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+      - name: Verify source and tools
+        run: |
+          mkdir -p validation-evidence
+          test "$(git rev-parse HEAD)" = b994e5f5f4d10f61817ad18ad5cf256ceed62ae3
+          git show --no-patch --format=fuller HEAD | tee validation-evidence/source.txt
+          java -version 2>&1 | tee validation-evidence/java.txt
+          mvn -version | tee validation-evidence/maven.txt
+          mvn -version | grep -E 'Apache Maven 3\.9\.'
+      - name: Compile DAO and reactor dependencies including tests
+        run: |
+          set -o pipefail
+          mvn -B -ntp -pl dao -am -DskipTests -Dpkg.skip=true test-compile 2>&1 | tee validation-evidence/dao-test-compile.log
+      - name: Run partition regression and adjacent date tests
+        run: |
+          set -o pipefail
+          mvn -B -ntp -pl dao -am -Dpkg.skip=true -Dtest=SqlPartitionTest,NoSqlTsPartitionDateTest -Dsurefire.failIfNoSpecifiedTests=false test 2>&1 | tee validation-evidence/partition-tests.log
+          cp dao/target/surefire-reports/TEST-org.thingsboard.server.dao.timeseries.*.xml validation-evidence/
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          reports = list(Path('validation-evidence').glob('TEST-*.xml'))
+          assert len(reports) == 2, reports
+          for path in reports:
+              suite = ET.parse(path).getroot()
+              print(path.name, suite.attrib)
+              assert int(suite.attrib['tests']) > 0
+              assert all(int(suite.attrib.get(k, 0)) == 0 for k in ('failures', 'errors', 'skipped'))
+              if 'SqlPartitionTest.xml' in path.name:
+                  assert int(suite.attrib['tests']) == 8
+          PY
+      - name: Confirm new regressions fail with original implementation
+        run: |
+          git show HEAD^:dao/src/main/java/org/thingsboard/server/dao/timeseries/SqlPartition.java > dao/src/main/java/org/thingsboard/server/dao/timeseries/SqlPartition.java
+          set +e
+          set -o pipefail
+          mvn -B -ntp -pl dao -am -Dpkg.skip=true -Dtest=SqlPartitionTest -Dsurefire.failIfNoSpecifiedTests=false test 2>&1 | tee validation-evidence/original-regression.log
+          result=${PIPESTATUS[0]}
+          set -e
+          test "$result" -ne 0
+          cp dao/target/surefire-reports/TEST-org.thingsboard.server.dao.timeseries.SqlPartitionTest.xml validation-evidence/original-regression.xml
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          suite = ET.parse('validation-evidence/original-regression.xml').getroot()
+          assert int(suite.attrib['tests']) == 8, suite.attrib
+          assert int(suite.attrib['failures']) == 8, suite.attrib
+          assert int(suite.attrib['errors']) == 0, suite.attrib
+          PY
+          git restore dao/src/main/java/org/thingsboard/server/dao/timeseries/SqlPartition.java
+          git diff --exit-code
+      - name: Check DAO license formatting
+        run: |
+          set -o pipefail
+          mvn -B -ntp -pl dao license:format 2>&1 | tee validation-evidence/license-format.log
+          git diff --exit-code
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: thingsboard-partition-validation
+          path: validation-evidence/
+          retention-days: 14
